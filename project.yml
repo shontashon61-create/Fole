@@ -1,6 +1,7 @@
 name: AIChat
 options:
   bundleIdPrefix: com.custom
+  xcodeVersion: "15.0"
   deploymentTarget:
     iOS: "16.0"
 targets:

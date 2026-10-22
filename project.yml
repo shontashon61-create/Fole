@@ -1,0 +1,17 @@
+name: AIChat
+options:
+  bundleIdPrefix: com.custom
+  deploymentTarget:
+    iOS: "16.0"
+targets:
+  AIChat:
+    type: application
+    platform: iOS
+    sources:
+      - Sources
+    info:
+      path: Sources/Info.plist
+      properties:
+        UILaunchScreen: {}
+        NSPhotoLibraryUsageDescription: "Доступ к фото нужен для отправки изображений в чат с ИИ"
+        UIApplicationSupportsIndirectInputEvents: true

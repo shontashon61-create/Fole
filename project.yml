@@ -1,7 +1,6 @@
 name: AIChat
 options:
   bundleIdPrefix: com.custom
-  xcodeVersion: "15.0"
   deploymentTarget:
     iOS: "16.0"
 targets:
@@ -15,4 +14,6 @@ targets:
       properties:
         UILaunchScreen: {}
         NSPhotoLibraryUsageDescription: "Доступ к фото нужен для отправки изображений в чат с ИИ"
+        NSMicrophoneUsageDescription: "Доступ к микрофону нужен для голосового ввода сообщений"
+        NSSpeechRecognitionUsageDescription: "Распознавание речи нужно для перевода голоса в текст"
         UIApplicationSupportsIndirectInputEvents: true

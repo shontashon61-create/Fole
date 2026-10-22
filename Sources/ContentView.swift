@@ -1,402 +1,735 @@
 import SwiftUI
 import PhotosUI
+import Speech
+import AVFoundation
 
 // MARK: - Модели данных
-struct ChatMessageModel: Identifiable, Codable {
+struct ChatEntry: Identifiable, Codable {
     var id = UUID()
-    let sender: String // "user" или "assistant"
-    var text: String
-    var imageData: Data? = nil
-    var timestamp = Date()
+    let role: String
+    var content: String
+    var photoData: Data? = nil
+    var createdAt = Date()
 }
 
-struct ChatConversation: Identifiable, Codable {
+struct DialogueThread: Identifiable, Codable {
     var id = UUID()
-    var title: String
-    var messages: [ChatMessageModel]
-    var updatedTime = Date()
+    var name: String
+    var items: [ChatEntry]
+    var modifiedAt = Date()
 }
 
-// MARK: - Главный экран чата
-ContentView: View {
-    @AppStorage("userApiKey") private var userApiKey: String = ""
-    @AppStorage("apiEndpoint") private var apiEndpoint: String = "https://api.openai.com/v1"
-    @AppStorage("activeModel") private var activeModel: String = "gpt-4o-mini"
-    @AppStorage("systemPromptText") private var systemPromptText: String = "Ты полезный и вежливый ИИ-ассистент."
-    @AppStorage("storedChatsData") private var storedChatsData: Data = Data()
+// MARK: - Голосовой движок (диктовка + озвучка)
+class SpeechService: NSObject, ObservableObject {
+    @Published var isListening = false
     
-    @State private var conversations: [ChatConversation] = []
-    @State private var activeChatId: UUID? = nil
-    @State private var userInputText: String = ""
-    @State private var photoPickerItem: PhotosPickerItem? = nil
-    @State private var currentImageData: Data? = nil
-    @State private var isWaitingForResponse: Bool = false
-    @State private var isSettingsPresented: Bool = false
-    @State private var statusMessage: String? = nil
+    private let recognizer = SFSpeechRecognizer(locale: Locale(identifier: "ru-RU"))
+    private var request: SFSpeechAudioBufferRecognitionRequest?
+    private var task: SFSpeechRecognitionTask?
+    private let engine = AVAudioEngine()
+    private let speaker = AVSpeechSynthesizer()
     
-    @FocusState private var isTextFieldFocused: Bool
+    func toggleDictation(onUpdate: @escaping (String) -> Void) {
+        if isListening {
+            stopDictation()
+        } else {
+            startDictation(onUpdate: onUpdate)
+        }
+    }
+    
+    private func startDictation(onUpdate: @escaping (String) -> Void) {
+        SFSpeechRecognizer.requestAuthorization { authStatus in
+            guard authStatus == .authorized else { return }
+            AVAudioSession.sharedInstance().requestRecordPermission { granted in
+                guard granted else { return }
+                DispatchQueue.main.async {
+                    self.launchAudioEngine(onUpdate: onUpdate)
+                }
+            }
+        }
+    }
+    
+    private func launchAudioEngine(onUpdate: @escaping (String) -> Void) {
+        task?.cancel()
+        task = nil
+        
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.record, mode: .measurement, options: .duckOthers)
+        try? session.setActive(true, options: .notifyOthersOnDeactivation)
+        
+        request = SFSpeechAudioBufferRecognitionRequest()
+        guard let activeRequest = request else { return }
+        activeRequest.shouldReportPartialResults = true
+        
+        let input = engine.inputNode
+        task = recognizer?.recognitionTask(with: activeRequest) { result, err in
+            if let text = result?.bestTranscription.formattedString {
+                DispatchQueue.main.async { onUpdate(text) }
+            }
+            if err != nil || (result?.isFinal ?? false) {
+                self.stopDictation()
+            }
+        }
+        
+        let format = input.outputFormat(forBus: 0)
+        input.removeTap(onBus: 0)
+        input.installTap(onBus: 0, bufferSize: 1024, format: format) { buf, _ in
+            self.request?.append(buf)
+        }
+        
+        engine.prepare()
+        try? engine.start()
+        isListening = true
+    }
+    
+    func stopDictation() {
+        if engine.isRunning {
+            engine.stop()
+            engine.inputNode.removeTap(onBus: 0)
+        }
+        request?.endAudio()
+        isListening = false
+    }
+    
+    func readAloud(_ text: String) {
+        if speaker.isSpeaking {
+            speaker.stopSpeaking(at: .immediate)
+            return
+        }
+        try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .default)
+        try? AVAudioSession.sharedInstance().setActive(true)
+        
+        let phrase = AVSpeechUtterance(string: text)
+        phrase.voice = AVSpeechSynthesisVoice(language: "ru-RU")
+        phrase.rate = 0.52
+        speaker.speak(phrase)
+    }
+}
+
+// MARK: - Основной интерфейс приложения
+struct ContentView: View {
+    @AppStorage("cfg_key") private var apiKey: String = ""
+    @AppStorage("cfg_url") private var baseURL: String = "https://api.openai.com/v1"
+    @AppStorage("cfg_model") private var modelName: String = "gpt-4o-mini"
+    @AppStorage("cfg_prompt") private var systemPrompt: String = "Ты умный ИИ-помощник. Отвечай понятно, красиво и без громоздких тегов LaTeX."
+    @AppStorage("cfg_threads") private var threadsStorage: Data = Data()
+    
+    @State private var threads: [DialogueThread] = []
+    @State private var selectedThreadId: UUID? = nil
+    
+    @State private var draftText: String = ""
+    @State private var pickerItem: PhotosPickerItem? = nil
+    @State private var draftPhoto: Data? = nil
+    @State private var isGenerating: Bool = false
+    @State private var showPrefs: Bool = false
+    @State private var showDrawer: Bool = false
+    @State private var alertBanner: String? = nil
+    
+    @FocusState private var keyboardActive: Bool
+    @StateObject private var speech = SpeechService()
+
+    private var activeThreadIndex: Int? {
+        threads.firstIndex(where: { $0.id == selectedThreadId })
+    }
 
     var body: some View {
-        NavigationView {
-            VStack(spacing: 0) {
-                // Список сообщений
-                ScrollViewReader { scrollProxy in
-                    ScrollView {
-                        LazyVStack(spacing: 14) {
-                            if let activeIndex = currentChatIndex, !conversations[activeIndex].messages.isEmpty {
-                                ForEach(conversations[activeIndex].messages) { message in
-                                    MessageRowView(message: message)
-                                        .id(message.id)
+        ZStack {
+            NavigationView {
+                VStack(spacing: 0) {
+                    // Окно переписки
+                    ScrollViewReader { scroller in
+                        ScrollView {
+                            LazyVStack(spacing: 16) {
+                                if let idx = activeThreadIndex, !threads[idx].items.isEmpty {
+                                    ForEach(threads[idx].items) { item in
+                                        ChatBubbleView(entry: item) {
+                                            speech.readAloud(item.content)
+                                        }
+                                        .id(item.id)
+                                    }
+                                } else {
+                                    WelcomeHeroView(onSelectHint: { sample in
+                                        draftText = sample
+                                        keyboardActive = true
+                                    })
                                 }
-                            } else {
-                                // Приветственный пустой экран
-                                VStack(spacing: 14) {
-                                    Image(systemName: "sparkles")
-                                        .font(.system(size: 48))
-                                        .foregroundColor(.blue)
-                                    Text("Новый диалог")
-                                        .font(.title2.bold())
-                                    Text("Задайте вопрос, отправьте фото или настройте системный промпт.")
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
-                                        .multilineTextAlignment(.center)
-                                        .padding(.horizontal, 24)
+                                
+                                if isGenerating {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "sparkles")
+                                            .foregroundColor(.purple)
+                                        ProgressView()
+                                        Text("Генерирую ответ...")
+                                            .font(.subheadline)
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                    }
+                                    .padding(.horizontal, 20)
                                 }
-                                .padding(.top, 80)
                             }
-                            
-                            if isWaitingForResponse {
-                                HStack(spacing: 10) {
-                                    ProgressView()
-                                    Text("ИИ думает...")
-                                        .font(.subheadline)
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                }
-                                .padding(.horizontal, 16)
-                                .id("loadingIndicator")
-                            }
+                            .padding(.vertical, 14)
                         }
-                        .padding(.vertical, 12)
-                    }
-                    .scrollDismissesKeyboard(.interactively)
-                    .onTapGesture {
-                        isTextFieldFocused = false
-                    }
-                    .onChange(of: conversations.first(where: { $0.id == activeChatId })?.messages.count) { _ in
-                        if let idx = currentChatIndex, let lastId = conversations[idx].messages.last?.id {
-                            withAnimation {
-                                scrollProxy.scrollTo(lastId, anchor: .bottom)
+                        .scrollDismissesKeyboard(.interactively)
+                        .onTapGesture { keyboardActive = false }
+                        .onChange(of: threads.first(where: { $0.id == selectedThreadId })?.items.count) { _ in
+                            if let idx = activeThreadIndex, let lastId = threads[idx].items.last?.id {
+                                withAnimation { scroller.scrollTo(lastId, anchor: .bottom) }
                             }
                         }
                     }
-                }
-                
-                // Ошибки или уведомления
-                if let errorText = statusMessage {
-                    Text(errorText)
-                        .font(.caption)
+                    
+                    // Плашка ошибки
+                    if let banner = alertBanner {
+                        HStack {
+                            Image(systemName: "exclamationmark.circle.fill")
+                            Text(banner).font(.caption).lineLimit(2)
+                            Spacer()
+                            Button(action: { alertBanner = nil }) {
+                                Image(systemName: "xmark")
+                            }
+                        }
                         .foregroundColor(.white)
-                        .padding(8)
-                        .frame(maxWidth: .infinity)
-                        .background(Color.red.opacity(0.85))
-                        .onTapGesture { statusMessage = nil }
-                }
-                
-                // Превью выбранной картинки
-                if let imgData = currentImageData, let uiImage = UIImage(data: imgData) {
-                    HStack {
-                        Image(uiImage: uiImage)
-                            .resizable()
-                            .scaledToFill()
-                            .frame(width: 60, height: 60)
-                            .clipShape(RoundedRectangle(cornerRadius: 12))
-                            .overlay(
-                                Button(action: { currentImageData = nil; photoPickerItem = nil }) {
-                                    Image(systemName: "xmark.circle.fill")
-                                        .foregroundColor(.white)
-                                        .background(Circle().fill(Color.black.opacity(0.6)))
+                        .padding(10)
+                        .background(Color.red.opacity(0.9))
+                    }
+                    
+                    // Превью прикреплённого фото
+                    if let data = draftPhoto, let img = UIImage(data: data) {
+                        HStack {
+                            Image(uiImage: img)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 64, height: 64)
+                                .clipShape(RoundedRectangle(cornerRadius: 12))
+                                .overlay(
+                                    Button(action: { draftPhoto = nil; pickerItem = nil }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.title3)
+                                            .foregroundColor(.white)
+                                            .background(Circle().fill(Color.black.opacity(0.6)))
+                                    }
+                                    .offset(x: 6, y: -6),
+                                    alignment: .topTrailing
+                                )
+                            Spacer()
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
+                    }
+                    
+                    // Нижняя панель ввода (в стиле Gemini)
+                    HStack(alignment: .bottom, spacing: 8) {
+                        PhotosPicker(selection: $pickerItem, matching: .images) {
+                            Image(systemName: "plus.circle.fill")
+                                .font(.system(size: 28))
+                                .foregroundStyle(.secondary)
+                        }
+                        .onChange(of: pickerItem) { newVal in
+                            Task {
+                                if let raw = try? await newVal?.loadTransferable(type: Data.self),
+                                   let uiImg = UIImage(data: raw),
+                                   let jpeg = uiImg.jpegData(compressionQuality: 0.7) {
+                                    draftPhoto = jpeg
                                 }
-                                .offset(x: 6, y: -6),
-                                alignment: .topTrailing
-                            )
-                        Spacer()
-                    }
-                    .padding(.horizontal, 16)
-                    .padding(.top, 6)
-                }
-                
-                Divider()
-                
-                // Панель ввода сообщения
-                HStack(alignment: .bottom, spacing: 10) {
-                    PhotosPicker(selection: $photoPickerItem, matching: .images) {
-                        Image(systemName: "photo.circle.fill")
-                            .font(.system(size: 28))
-                            .foregroundColor(.blue)
-                    }
-                    .onChange(of: photoPickerItem) { newItem in
-                        Task {
-                            if let data = try? await newItem?.loadTransferable(type: Data.self),
-                               let img = UIImage(data: data),
-                               let compressed = img.jpegData(compressionQuality: 0.7) {
-                                currentImageData = compressed
+                            }
+                        }
+                        
+                        TextField("Спросите ИИ...", text: $draftText, axis: .vertical)
+                            .lineLimit(1...5)
+                            .focused($keyboardActive)
+                            .padding(.vertical, 8)
+                            .padding(.horizontal, 4)
+                        
+                        // Микрофон
+                        Button(action: {
+                            keyboardActive = false
+                            speech.toggleDictation { recognized in
+                                draftText = recognized
+                            }
+                        }) {
+                            Image(systemName: speech.isListening ? "waveform.circle.fill" : "mic.fill")
+                                .font(.system(size: speech.isListening ? 28 : 20))
+                                .foregroundColor(speech.isListening ? .red : .secondary)
+                                .padding(.bottom, 4)
+                        }
+                        
+                        // Отправка
+                        if readyToSend {
+                            Button(action: submitQuery) {
+                                Image(systemName: "arrow.up.circle.fill")
+                                    .font(.system(size: 30))
+                                    .foregroundStyle(
+                                        LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                                    )
                             }
                         }
                     }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(RoundedRectangle(cornerRadius: 24))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 8)
+                }
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .navigationBarLeading) {
+                        Button(action: {
+                            keyboardActive = false
+                            withAnimation(.easeInOut(duration: 0.25)) { showDrawer.toggle() }
+                        }) {
+                            Image(systemName: "line.3.horizontal")
+                                .font(.title3.bold())
+                        }
+                    }
                     
-                    TextField("Сообщение...", text: $userInputText, axis: .vertical)
-                        .lineLimit(1...5)
-                        .focused($isTextFieldFocused)
-                        .padding(10)
-                        .background(Color(.systemGray6))
-                        .cornerRadius(18)
+                    ToolbarItem(placement: .principal) {
+                        HStack(spacing: 6) {
+                            Image(systemName: "sparkles")
+                                .foregroundStyle(LinearGradient(colors: [.blue, .purple], startPoint: .top, endPoint: .bottom))
+                            Text(modelName).font(.headline)
+                        }
+                    }
                     
-                    Button(action: handleSendMessage) {
-                        Image(systemName: "arrow.up.circle.fill")
-                            .font(.system(size: 32))
-                            .foregroundColor(canSend ? .blue : .gray)
-                    }
-                    .disabled(!canSend)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .background(Color(.systemBackground))
-            }
-            .navigationTitle(activeModel)
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .navigationBarLeading) {
-                    Button(action: startNewChat) {
-                        Image(systemName: "square.and.pencil")
+                    ToolbarItemGroup(placement: .navigationBarTrailing) {
+                        if keyboardActive {
+                            Button(action: { keyboardActive = false }) {
+                                Image(systemName: "keyboard.chevron.compact.down")
+                            }
+                        }
+                        Button(action: createFreshThread) {
+                            Image(systemName: "square.and.pencil")
+                        }
+                        Button(action: {
+                            keyboardActive = false
+                            showPrefs = true
+                        }) {
+                            Image(systemName: "gearshape.fill")
+                        }
                     }
                 }
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    Button(action: { isSettingsPresented = true }) {
-                        Image(systemName: "gearshape.fill")
-                    }
+                .sheet(isPresented: $showPrefs) {
+                    PreferencesSheet(apiKey: $apiKey, baseURL: $baseURL, modelName: $modelName, systemPrompt: $systemPrompt)
                 }
             }
-            .sheet(isPresented: $isSettingsPresented) {
-                SettingsModalView(
-                    apiKey: $userApiKey,
-                    endpoint: $apiEndpoint,
-                    model: $activeModel,
-                    prompt: $systemPromptText
-                )
+            .navigationViewStyle(.stack)
+            
+            // Боковое выдвижное меню с историей диалогов
+            if showDrawer {
+                Color.black.opacity(0.4)
+                    .ignoresSafeArea()
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.25)) { showDrawer = false }
+                    }
+                
+                HStack(spacing: 0) {
+                    DrawerMenuView(
+                        threads: $threads,
+                        selectedId: $selectedThreadId,
+                        onPick: { id in
+                            selectedThreadId = id
+                            withAnimation { showDrawer = false }
+                        },
+                        onCreate: {
+                            createFreshThread()
+                            withAnimation { showDrawer = false }
+                        },
+                        onRemove: { id in removeThread(id: id) }
+                    )
+                    .frame(width: 280)
+                    .background(Color(.systemBackground))
+                    
+                    Spacer()
+                }
+                .transition(.move(edge: .leading))
             }
         }
-        .onAppear(perform: loadStoredChats)
+        .onAppear(perform: restoreThreads)
     }
     
-    private var currentChatIndex: Int? {
-        conversations.firstIndex(where: { $0.id == activeChatId })
+    private var readyToSend: Bool {
+        (!draftText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || draftPhoto != nil) && !isGenerating
     }
     
-    private var canSend: Bool {
-        (!userInputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || currentImageData != nil) && !isWaitingForResponse
-    }
-    
-    private func loadStoredChats() {
-        if let decoded = try? JSONDecoder().decode([ChatConversation].self, from: storedChatsData), !decoded.isEmpty {
-            conversations = decoded
-            activeChatId = conversations.first?.id
+    // MARK: - Управление историей чатов
+    private func restoreThreads() {
+        if let list = try? JSONDecoder().decode([DialogueThread].self, from: threadsStorage), !list.isEmpty {
+            threads = list
+            selectedThreadId = threads.first?.id
         } else {
-            startNewChat()
+            createFreshThread()
         }
     }
     
-    private func saveStoredChats() {
-        if let encoded = try? JSONEncoder().encode(conversations) {
-            storedChatsData = encoded
+    private func persistThreads() {
+        if let data = try? JSONEncoder().encode(threads) {
+            threadsStorage = data
         }
     }
     
-    private func startNewChat() {
-        let newConv = ChatConversation(title: "Новый чат", messages: [])
-        conversations.insert(newConv, at: 0)
-        activeChatId = newConv.id
-        saveStoredChats()
+    private func createFreshThread() {
+        let fresh = DialogueThread(name: "Новый чат", items: [])
+        threads.insert(fresh, at: 0)
+        selectedThreadId = fresh.id
+        persistThreads()
     }
     
-    private func handleSendMessage() {
-        isTextFieldFocused = false
-        guard !userApiKey.isEmpty else {
-            statusMessage = "Укажите API ключ в настройках!"
-            isSettingsPresented = true
+    private func removeThread(id: UUID) {
+        threads.removeAll { $0.id == id }
+        if threads.isEmpty {
+            createFreshThread()
+        } else if selectedThreadId == id {
+            selectedThreadId = threads.first?.id
+        }
+        persistThreads()
+    }
+    
+    // MARK: - Запрос к нейросети
+    private func submitQuery() {
+        keyboardActive = false
+        if speech.isListening { speech.stopDictation() }
+        
+        guard !apiKey.isEmpty else {
+            alertBanner = "Сначала добавьте API ключ в настройках ⚙️"
+            showPrefs = true
             return
         }
         
-        if currentChatIndex == nil {
-            startNewChat()
+        if activeThreadIndex == nil { createFreshThread() }
+        guard let idx = activeThreadIndex else { return }
+        
+        alertBanner = nil
+        let cleanText = draftText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let attachedPic = draftPhoto
+        
+        let userEntry = ChatEntry(role: "user", content: cleanText, photoData: attachedPic)
+        threads[idx].items.append(userEntry)
+        
+        if threads[idx].name == "Новый чат" && !cleanText.isEmpty {
+            threads[idx].name = String(cleanText.prefix(30))
         }
-        guard let index = currentChatIndex else { return }
+        threads[idx].modifiedAt = Date()
+        persistThreads()
         
-        statusMessage = nil
-        let textContent = userInputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let imagePayload = currentImageData
+        draftText = ""
+        draftPhoto = nil
+        pickerItem = nil
+        isGenerating = true
         
-        let userMessage = ChatMessageModel(sender: "user", text: textContent, imageData: imagePayload)
-        conversations[index].messages.append(userMessage)
-        
-        if conversations[index].title == "Новый чат" && !textContent.isEmpty {
-            conversations[index].title = String(textContent.prefix(30))
-        }
-        conversations[index].updatedTime = Date()
-        saveStoredChats()
-        
-        userInputText = ""
-        currentImageData = nil
-        photoPickerItem = nil
-        isWaitingForResponse = true
-        
-        let historySnapshot = conversations[index].messages
+        let snapshot = threads[idx].items
         
         Task {
             do {
-                let responseText = try await sendRequestToAPI(messages: historySnapshot)
+                let rawAnswer = try await requestCompletion(history: snapshot)
+                let prettyAnswer = sanitizeMathSymbols(rawAnswer)
                 await MainActor.run {
-                    if let curIdx = currentChatIndex {
-                        conversations[curIdx].messages.append(ChatMessageModel(sender: "assistant", text: responseText))
-                        saveStoredChats()
+                    if let cur = activeThreadIndex {
+                        threads[cur].items.append(ChatEntry(role: "assistant", content: prettyAnswer))
+                        persistThreads()
                     }
-                    isWaitingForResponse = false
+                    isGenerating = false
                 }
             } catch {
                 await MainActor.run {
-                    statusMessage = "Ошибка: \(error.localizedDescription)"
-                    isWaitingForResponse = false
+                    alertBanner = error.localizedDescription
+                    isGenerating = false
                 }
             }
         }
     }
     
-    private func sendRequestToAPI(messages: [ChatMessageModel]) async throws -> String {
-        let cleanBase = apiEndpoint.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        let endpointURL = cleanBase.hasSuffix("/chat/completions") ? cleanBase : "\(cleanBase)/chat/completions"
-        
-        guard let url = URL(string: endpointURL) else {
-            throw URLError(.badURL)
+    private func sanitizeMathSymbols(_ input: String) -> String {
+        var out = input
+        let replacements: [(String, String)] = [
+            ("\\(", ""), ("\\)", ""), ("\\[", "\n"), ("\\]", "\n"),
+            ("\\left", ""), ("\\right", ""), ("\\cdot", "·"),
+            ("\\times", "×"), ("\\div", "÷"), ("\\pm", "±"),
+            ("\\approx", "≈"), ("\\neq", "≠"), ("\\leq", "≤"), ("\\geq", "≥")
+        ]
+        for (target, replacement) in replacements {
+            out = out.replacingOccurrences(of: target, with: replacement)
         }
+        return out
+    }
+    
+    private func requestCompletion(history: [ChatEntry]) async throws -> String {
+        let trimmedURL = baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let fullPath = trimmedURL.hasSuffix("/chat/completions") ? trimmedURL : "\(trimmedURL)/chat/completions"
         
-        var payloadMessages: [[String: Any]] = []
-        if !systemPromptText.isEmpty {
-            payloadMessages.append(["role": "system", "content": systemPromptText])
-        }
+        guard let endpoint = URL(string: fullPath) else { throw URLError(.badURL) }
         
-        for msg in messages {
-            if let imgData = msg.imageData {
-                let base64String = imgData.base64EncodedString()
-                var contentList: [[String: Any]] = []
-                if !msg.text.isEmpty {
-                    contentList.append(["type": "text", "text": msg.text])
-                }
-                contentList.append([
-                    "type": "image_url",
-                    "image_url": ["url": "data:image/jpeg;base64,\(base64String)"]
-                ])
-                payloadMessages.append(["role": msg.sender, "content": contentList])
-            } else {
-                payloadMessages.append(["role": msg.sender, "content": msg.text])
-            }
-        }
-        
-        let requestBody: [String: Any] = [
-            "model": activeModel,
-            "messages": payloadMessages
+        var messagesArray: [[String: Any]] = [
+            ["role": "system", "content": systemPrompt + "\nНе используй LaTeX-формулы вроде \\frac или \\left, пиши обычными понятными символами."]
         ]
         
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(userApiKey)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: requestBody)
-        
-        let (data, response) = try await URLSession.shared.data(for: request)
-        if let httpResponse = response as? HTTPURLResponse, !(200...299).contains(httpResponse.statusCode) {
-            let errorMessage = String(data: data, encoding: .utf8) ?? "Код ошибки: \(httpResponse.statusCode)"
-            throw NSError(domain: "APIError", code: httpResponse.statusCode, userInfo: [NSLocalizedDescriptionKey: errorMessage])
+        for item in history {
+            if let pic = item.photoData {
+                let b64 = pic.base64EncodedString()
+                var parts: [[String: Any]] = []
+                if !item.content.isEmpty {
+                    parts.append(["type": "text", "text": item.content])
+                }
+                parts.append(["type": "image_url", "image_url": ["url": "data:image/jpeg;base64,\(b64)"]])
+                messagesArray.append(["role": item.role, "content": parts])
+            } else {
+                messagesArray.append(["role": item.role, "content": item.content])
+            }
         }
         
-        guard let jsonResult = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let choices = jsonResult["choices"] as? [[String: Any]],
-              let firstChoice = choices.first,
-              let messageObj = firstChoice["message"] as? [String: Any],
-              let content = messageObj["content"] as? String else {
-            throw NSError(domain: "ParseError", code: 0, userInfo: [NSLocalizedDescriptionKey: "Не удалось прочитать ответ от сервера"])
+        let payload: [String: Any] = ["model": modelName, "messages": messagesArray]
+        
+        var req = URLRequest(url: endpoint)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: payload)
+        
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        
+        if let http = resp as? HTTPURLResponse, !(200...299).contains(http.statusCode) {
+            let msg = String(data: data, encoding: .utf8) ?? "Ошибка сервера \(http.statusCode)"
+            throw NSError(domain: "NetErr", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: msg])
         }
         
-        return content
+        guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let choices = root["choices"] as? [[String: Any]],
+              let first = choices.first,
+              let msgDict = first["message"] as? [String: Any],
+              let replyText = msgDict["content"] as? String else {
+            throw NSError(domain: "FormatErr", code: 0, userInfo: [NSLocalizedDescriptionKey: "Не удалось разобрать ответ от ИИ"])
+        }
+        
+        return replyText
     }
 }
 
-// MARK: - Компонент отображения сообщения
-struct MessageRowView: View {
-    let message: ChatMessageModel
-    private var isUser: Bool { message.sender == "user" }
+// MARK: - Приветственный экран с быстрыми идеями
+struct WelcomeHeroView: View {
+    let onSelectHint: (String) -> Void
     
     var body: some View {
-        HStack {
-            if isUser { Spacer(minLength: 40) }
+        VStack(spacing: 18) {
+            Spacer(minLength: 50)
+            Image(systemName: "sparkles")
+                .font(.system(size: 54))
+                .foregroundStyle(LinearGradient(colors: [.blue, .purple, .pink], startPoint: .topLeading, endPoint: .bottomTrailing))
+            
+            Text("Привет! Чем помочь?")
+                .font(.title2.bold())
+            
+            Text("Задайте любой вопрос, прикрепите картинку или нажмите на микрофон.")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+            
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 10) {
+                    HintButton(label: "Объясни просто", icon: "lightbulb.fill") {
+                        onSelectHint("Объясни простыми словами: ")
+                    }
+                    HintButton(label: "Помоги по фото", icon: "camera.viewfinder") {
+                        onSelectHint("Разбери задание на фото понятным текстом")
+                    }
+                    HintButton(label: "Придумай идею", icon: "wand.and.stars") {
+                        onSelectHint("Придумай 5 интересных идей для ")
+                    }
+                }
+                .padding(.horizontal, 20)
+            }
+            .padding(.top, 8)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+struct HintButton: View {
+    let label: String
+    let icon: String
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                Image(systemName: icon).foregroundColor(.blue)
+                Text(label).font(.subheadline).foregroundColor(.primary)
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, 10)
+            .background(Color(.secondarySystemBackground))
+            .cornerRadius(16)
+        }
+    }
+}
+
+// MARK: - Боковое меню со списком чатов
+struct DrawerMenuView: View {
+    @Binding var threads: [DialogueThread]
+    @Binding var selectedId: UUID?
+    let onPick: (UUID) -> Void
+    let onCreate: () -> Void
+    let onRemove: (UUID) -> Void
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack {
+                Image(systemName: "sparkles")
+                    .foregroundStyle(LinearGradient(colors: [.blue, .purple], startPoint: .top, endPoint: .bottom))
+                Text("Чаты").font(.title3.bold())
+                Spacer()
+            }
+            .padding()
+            
+            Button(action: onCreate) {
+                HStack {
+                    Image(systemName: "plus")
+                    Text("Новый диалог").fontWeight(.semibold)
+                    Spacer()
+                }
+                .padding(12)
+                .background(Color.blue.opacity(0.15))
+                .foregroundColor(.blue)
+                .cornerRadius(14)
+            }
+            .padding(.horizontal)
+            .padding(.bottom, 12)
+            
+            Divider()
+            
+            ScrollView {
+                LazyVStack(spacing: 6) {
+                    ForEach(threads) { item in
+                        HStack {
+                            Image(systemName: "bubble.left.fill")
+                                .font(.subheadline)
+                                .foregroundColor(item.id == selectedId ? .blue : .secondary)
+                            Text(item.name)
+                                .font(.subheadline)
+                                .lineLimit(1)
+                            Spacer()
+                            Button(action: { onRemove(item.id) }) {
+                                Image(systemName: "trash")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(12)
+                        .background(item.id == selectedId ? Color(.secondarySystemBackground) : Color.clear)
+                        .cornerRadius(12)
+                        .contentShape(Rectangle())
+                        .onTapGesture { onPick(item.id) }
+                    }
+                }
+                .padding(10)
+            }
+        }
+    }
+}
+
+// MARK: - Оформление сообщений
+struct ChatBubbleView: View {
+    let entry: ChatEntry
+    let onReadAloud: () -> Void
+    private var isUser: Bool { entry.role == "user" }
+    
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            if !isUser {
+                Image(systemName: "sparkles")
+                    .font(.system(size: 15, weight: .bold))
+                    .foregroundStyle(LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing))
+                    .frame(width: 30, height: 30)
+                    .background(Color(.secondarySystemBackground))
+                    .clipShape(Circle())
+            } else {
+                Spacer(minLength: 40)
+            }
             
             VStack(alignment: isUser ? .trailing : .leading, spacing: 6) {
-                if let imgData = message.imageData, let image = UIImage(data: imgData) {
-                    Image(uiImage: image)
+                if let picData = entry.photoData, let img = UIImage(data: picData) {
+                    Image(uiImage: img)
                         .resizable()
                         .scaledToFit()
-                        .frame(maxWidth: 220, maxHeight: 220)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
+                        .frame(maxWidth: 230, maxHeight: 230)
+                        .clipShape(RoundedRectangle(cornerRadius: 16))
                 }
                 
-                if !message.text.isEmpty {
-                    Text(message.text)
-                        .font(.body)
-                        .foregroundColor(isUser ? .white : .primary)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 10)
-                        .background(isUser ? Color.blue : Color(.systemGray5))
-                        .clipShape(RoundedRectangle(cornerRadius: 18))
-                        .textSelection(.enabled)
+                if !entry.content.isEmpty {
+                    Group {
+                        if let parsed = try? AttributedString(markdown: entry.content, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+                            Text(parsed)
+                        } else {
+                            Text(entry.content)
+                        }
+                    }
+                    .font(.body)
+                    .foregroundColor(isUser ? .white : .primary)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(
+                        isUser
+                        ? AnyShapeStyle(LinearGradient(colors: [.blue, .indigo], startPoint: .topLeading, endPoint: .bottomTrailing))
+                        : AnyShapeStyle(Color(.secondarySystemBackground))
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 18))
+                    .textSelection(.enabled)
+                }
+                
+                if !isUser && !entry.content.isEmpty {
+                    HStack(spacing: 16) {
+                        Button(action: onReadAloud) {
+                            Label("Озвучить", systemImage: "speaker.wave.2")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        Button(action: { UIPasteboard.general.string = entry.content }) {
+                            Label("Копировать", systemImage: "doc.on.doc")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.leading, 6)
                 }
             }
             
-            if !isUser { Spacer(minLength: 40) }
+            if !isUser { Spacer(minLength: 20) }
         }
-        .padding(.horizontal, 12)
+        .padding(.horizontal, 14)
     }
 }
 
-// MARK: - Модальное окно настроек
-struct SettingsModalView: View {
+// MARK: - Экран настроек
+struct PreferencesSheet: View {
     @Binding var apiKey: String
-    @Binding var endpoint: String
-    @Binding var model: String
-    @Binding var prompt: String
+    @Binding var baseURL: String
+    @Binding var modelName: String
+    @Binding var systemPrompt: String
     @Environment(\.dismiss) var dismiss
     
     var body: some View {
         NavigationView {
             Form {
-                Section(header: Text("Параметры подключения")) {
+                Section(header: Text("Параметры API")) {
                     SecureField("API Ключ", text: $apiKey)
-                    TextField("Base URL", text: $endpoint)
+                    TextField("Base URL", text: $baseURL)
                         .keyboardType(.URL)
                         .autocapitalization(.none)
-                    TextField("Модель", text: $model)
+                        .disableAutocorrection(true)
+                    TextField("Модель", text: $modelName)
                         .autocapitalization(.none)
+                        .disableAutocorrection(true)
                 }
                 
                 Section(header: Text("Системный промпт")) {
-                    TextEditor(text: $prompt)
-                        .frame(minHeight: 100)
+                    TextEditor(text: $systemPrompt)
+                        .frame(minHeight: 110)
                 }
             }
             .navigationTitle("Настройки")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("Готово") { dismiss() }
-                        .bold()
+                    Button("Готово") { dismiss() }.bold()
                 }
             }
         }

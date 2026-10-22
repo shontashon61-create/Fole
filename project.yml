@@ -13,7 +13,7 @@ targets:
       path: Sources/Info.plist
       properties:
         UILaunchScreen: {}
-        NSPhotoLibraryUsageDescription: "Доступ к фото нужен для отправки изображений в чат с ИИ"
-        NSMicrophoneUsageDescription: "Доступ к микрофону нужен для голосового ввода сообщений"
-        NSSpeechRecognitionUsageDescription: "Распознавание речи нужно для перевода голоса в текст"
+        NSPhotoLibraryUsageDescription: "Нужен доступ к галерее для прикрепления фото"
+        NSMicrophoneUsageDescription: "Нужен доступ к микрофону для голосового ввода"
+        NSSpeechRecognitionUsageDescription: "Нужен доступ для перевода речи в текст"
         UIApplicationSupportsIndirectInputEvents: true

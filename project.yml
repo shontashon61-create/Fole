@@ -14,6 +14,7 @@ targets:
       properties:
         UILaunchScreen: {}
         NSPhotoLibraryUsageDescription: "Нужен доступ к галерее для прикрепления фото"
+        NSCameraUsageDescription: "Нужен доступ к камере, чтобы делать фото прямо в чате"
         NSMicrophoneUsageDescription: "Нужен доступ к микрофону для голосового ввода"
         NSSpeechRecognitionUsageDescription: "Нужен доступ для перевода речи в текст"
         UIApplicationSupportsIndirectInputEvents: true
